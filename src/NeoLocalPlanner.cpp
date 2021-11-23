@@ -403,12 +403,10 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 	double control_vel_y = 0;
 	double control_yawrate = 0;
 
-	if(is_goal_target && max_backup_dist > 0
-		&& fabs(pos_error.x()) < (m_state == state_t::STATE_TURNING ? 0 : -1 * max_backup_dist))
+	if(is_goal_target)
 	{
 		// use term for final stopping position
 		control_vel_x = pos_error.x() * pos_x_gain;
-		std::cout<<"pose error"<<control_vel_x<<std::endl;
 	}
 	else
 	{
@@ -449,7 +447,7 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 		{
 			const double stop_accel = 0.9 * acc_lim_x;
 			const double stop_time = sqrt(2 * fmax(obstacle_dist, 0) / stop_accel);
-			const double max_vel_x = m_robot_direction * stop_accel * stop_time;
+			const double max_vel_x = stop_accel * stop_time;
 
 			// check if it's much lower than current velocity
 			if(fabs(max_vel_x) < 0.5 * fabs(start_vel_x)) {
@@ -476,7 +474,8 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 		
 	}
 	// limit backing up
-	if(is_goal_target	)
+	if(is_goal_target	 && max_backup_dist > 0
+		&& fabs(pos_error.x()) < (m_state == state_t::STATE_TURNING ? 0 : -1 * max_backup_dist))
 	{
 		control_vel_x = 0;
 		m_state = state_t::STATE_TURNING;
@@ -592,27 +591,34 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 	// logic check
 	is_emergency_brake = is_emergency_brake && fabs(control_vel_x) >= 0;
 
+
+
 	// apply low pass filter
 	control_vel_x = control_vel_x * low_pass_gain + m_last_control_values[0] * (1 - low_pass_gain);
 	control_vel_y = control_vel_y * low_pass_gain + m_last_control_values[1] * (1 - low_pass_gain);
 	control_yawrate = control_yawrate * low_pass_gain + m_last_control_values[2] * (1 - low_pass_gain);
 
+	if(is_goal_target) {
+		std::cout<<"after pass"<<control_vel_x<<std::endl;
+	}
+
 	// apply acceleration limits
 	// apply_acceleratiion_limits(control_vel_x, control_vel_y, control_yawrate, 
 	// 	m_last_cmd_vel, is_emergency_brake, m_robot_direction, dt);
-
 	if(m_robot_direction == -1.0) {
-
-		acc_lim_x = m_robot_direction * acc_lim_x;
-		control_vel_x = m_robot_direction * fmin(fabs(control_vel_x), fabs(m_last_cmd_vel.linear.x + acc_lim_x * dt));
-		control_vel_x = m_robot_direction * fmax(fabs(control_vel_x), fabs(m_last_cmd_vel.linear.x - 
-		(is_emergency_brake ?  m_robot_direction * emergency_acc_lim_x : acc_lim_x) * dt));
-
+		if(!is_goal_target){
+			acc_lim_x = m_robot_direction * acc_lim_x;
+			control_vel_x = m_robot_direction * fmin(fabs(control_vel_x), fabs(m_last_cmd_vel.linear.x + acc_lim_x * dt));
+			control_vel_x = m_robot_direction * fmax(fabs(control_vel_x), fabs(m_last_cmd_vel.linear.x - 
+			(is_emergency_brake ?  m_robot_direction * emergency_acc_lim_x : acc_lim_x) * dt));
+		}
 	} else {
 		control_vel_x = fmax(fmin(control_vel_x, m_last_cmd_vel.linear.x + acc_lim_x * dt),
 							m_last_cmd_vel.linear.x - (is_emergency_brake ? emergency_acc_lim_x : acc_lim_x) * dt);
 	}
-	
+		if(is_goal_target) {
+		std::cout<<"after"<<control_vel_x<<std::endl;
+	}
 	// Calculate vel_y
 	control_vel_y = fmin(control_vel_y, m_last_cmd_vel.linear.y + acc_lim_y * dt);
 	control_vel_y = fmax(control_vel_y, m_last_cmd_vel.linear.y - acc_lim_y * dt);
@@ -639,14 +645,16 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 	}
 
 	// fill return data
+	std::cout<<control_vel_x<<std::endl;
 
 
 	if(m_robot_direction == -1.0) {
-		cmd_vel.linear.x = m_robot_direction * fmin(fmax(fabs(control_vel_x), fabs(min_vel_x)), max_vel_x);
+		cmd_vel.linear.x = fmax(fmin(control_vel_x, 0.2), m_robot_direction*max_vel_x);
 	}
 	else {
-		cmd_vel.linear.x = fmin(fmax(control_vel_x, min_vel_x), max_vel_x);
+		cmd_vel.linear.x = fmin(fmax(control_vel_x, -0.2), max_vel_x);
 	}
+
 	cmd_vel.linear.y = fmin(fmax(control_vel_y, min_vel_y), max_vel_y);
 	cmd_vel.linear.z = 0;
 	cmd_vel.angular.x = 0;
@@ -676,7 +684,6 @@ void NeoLocalPlanner::cleanup()
 
 void NeoLocalPlanner::activate()
 {
-	count = 0;
 	m_local_plan_pub->on_activate();
 }
 
@@ -698,6 +705,7 @@ bool NeoLocalPlanner::reset_lastvel(nav_msgs::msg::Path m_global_plan, nav_msgs:
 		m_last_control_values[1] = 0;
 		m_last_control_values[2] = 0;
 		geometry_msgs::msg::Twist m_last_cmd_vel;
+		count = 0;
 		return true;
 	}
 	
