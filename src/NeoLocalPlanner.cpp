@@ -196,13 +196,38 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 			"lookupTransform(m_local_frame, m_global_frame) failed");
 	}
 
+	tf2::Stamped<tf2::Transform> global_to_robot;
+	try {
+		geometry_msgs::msg::TransformStamped msg = tf_->lookupTransform("base_link", m_global_frame, tf2::TimePointZero);
+		tf2::fromMsg(msg, global_to_robot);
+	} catch(...) {
+		RCLCPP_WARN_THROTTLE(logger_, *clock_, 1.0, 
+			"lookupTransform(base_link, m_global_frame) failed");
+	}
+
 	// transform plan to local frame (odom)
 	std::vector<tf2::Transform> local_plan;
+	std::vector<tf2::Transform> transformed_plan;
+
 	for(const auto& pose : m_global_plan.poses)
 	{
 		tf2::Transform pose_;
+		tf2::Transform robot_pose_;
 		tf2::fromMsg(pose.pose, pose_);
+		tf2::fromMsg(pose.pose, robot_pose_);
 		local_plan.push_back(global_to_local * pose_);
+		transformed_plan.push_back(global_to_robot * robot_pose_);
+	}
+
+	if(m_allow_reversing and count<=1) {
+		auto point_1 = tf2::toMsg(transformed_plan[5]);
+
+		// Estimate if the robot has travelled and then determine if the path is reversed! ToDo
+		// Just checks if the goal is in the rear end of the robot
+		auto reverse_path = point_1.translation.x;
+
+		m_robot_direction = reverse_path >= 0.0 ? 1.0 : -1.0;
+		count++;
 	}
 
 	// get latest local pose
@@ -311,7 +336,7 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 						pose * tf2::Vector3(delta_move, 0, 0));	
 			}	else {
 				pose = tf2::Transform(createQuaternionFromYaw(tf2::getYaw(pose.getRotation()) + start_yawrate * delta_time),
-						pose * tf2::Vector3(-1 * delta_move, 0, 0));	
+						pose * tf2::Vector3(m_robot_direction * delta_move, 0, 0));	
 			}
 
 			obstacle_dist += delta_move;
@@ -345,7 +370,6 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 	}
 	// figure out target orientation
 	double target_yaw = 0;
-
 	if(is_goal_target)
 	{
 		// take goal orientation
@@ -363,7 +387,7 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 	const tf2::Vector3 target_pos = iter_target->getOrigin();
 	double yaw_error = 0.0;
 
-	if(!m_allow_reversing or is_goal_target) {
+	if(m_robot_direction==1 or is_goal_target) {
 		yaw_error = angles::shortest_angular_distance(actual_yaw, target_yaw);
 	} else {
 		yaw_error = angles::shortest_angular_distance(actual_yaw + 3.14, target_yaw); 
@@ -379,19 +403,12 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 	double control_vel_y = 0;
 	double control_yawrate = 0;
 
-	if(m_allow_reversing) {
-		// Also determine if the robot needs to be reversed
-		auto point_0 = tf2::toMsg(local_plan[0]);
-		auto point_1 = tf2::toMsg(local_plan[1]);
-		auto reverse_path = point_1.translation.x - point_0.translation.x;
-
-		m_robot_direction = reverse_path >= 0.0 ? 1.0 : -1.0;
-	}
-
-	if(is_goal_target)
+	if(is_goal_target && max_backup_dist > 0
+		&& fabs(pos_error.x()) < (m_state == state_t::STATE_TURNING ? 0 : -1 * max_backup_dist))
 	{
 		// use term for final stopping position
 		control_vel_x = pos_error.x() * pos_x_gain;
+		std::cout<<"pose error"<<control_vel_x<<std::endl;
 	}
 	else
 	{
@@ -407,22 +424,20 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 		{
 			const double max_vel_x = max_curve_vel * (lookahead_dist / fabs(yaw_error));
 			if(m_robot_direction == -1.0) {
-				control_vel_x = m_robot_direction * fmin(control_vel_x, max_vel_x);	
+				control_vel_x = m_robot_direction * fmin(fabs(control_vel_x), max_vel_x);	
 			} else {
 				control_vel_x = fmin(control_vel_x, max_vel_x);
 			}
-			
 		}
 
 		// limit velocity when approaching goal position
-		if(start_vel_x > 0)
-		{
+		if(fabs(start_vel_x) > 0)	{
 			const double stop_accel = 0.8 * acc_lim_x;
 			const double stop_time = sqrt(2 * fmax(fabs(goal_dist), 0) / stop_accel);
 
 			if(m_robot_direction == -1.0) {
-				const double max_vel_x = m_robot_direction * fmax(stop_accel * stop_time, min_vel_trans);
-				control_vel_x = m_robot_direction * fmin(control_vel_x, max_vel_x);	
+				const double max_vel_x = m_robot_direction * fmax(stop_accel * stop_time, 0.2);
+				control_vel_x = m_robot_direction * fmin(fabs(control_vel_x), fabs(max_vel_x));	
 			} else {
 				const double max_vel_x = fmax(stop_accel * stop_time, min_vel_trans);
 				control_vel_x = fmin(control_vel_x, max_vel_x);
@@ -430,19 +445,19 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 		}
 
 		// limit velocity when approaching an obstacle
-		if(have_obstacle && start_vel_x > 0)
+		if(have_obstacle && fabs(start_vel_x) > 0)
 		{
 			const double stop_accel = 0.9 * acc_lim_x;
 			const double stop_time = sqrt(2 * fmax(obstacle_dist, 0) / stop_accel);
-			const double max_vel_x = stop_accel * stop_time;
+			const double max_vel_x = m_robot_direction * stop_accel * stop_time;
 
 			// check if it's much lower than current velocity
-			if(max_vel_x < 0.5 * start_vel_x) {
+			if(fabs(max_vel_x) < 0.5 * fabs(start_vel_x)) {
 				is_emergency_brake = true;
 			}
 
 			if(m_robot_direction == -1.0) {
-				control_vel_x = m_robot_direction * fmin(control_vel_x, max_vel_x);	
+				control_vel_x = m_robot_direction * fmin(fabs(control_vel_x), max_vel_x);	
 			} else {
 				control_vel_x = fmin(control_vel_x, max_vel_x);
 			}
@@ -461,9 +476,7 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 		
 	}
 	// limit backing up
-	if(is_goal_target && max_backup_dist > 0
-		&& pos_error.x() < (m_state == state_t::STATE_TURNING ? 0 : -1 * max_backup_dist) 
-		&& !m_allow_reversing)
+	if(is_goal_target	)
 	{
 		control_vel_x = 0;
 		m_state = state_t::STATE_TURNING;
@@ -589,10 +602,12 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 	// 	m_last_cmd_vel, is_emergency_brake, m_robot_direction, dt);
 
 	if(m_robot_direction == -1.0) {
+
 		acc_lim_x = m_robot_direction * acc_lim_x;
-		control_vel_x = fmin(fabs(control_vel_x), fabs(m_last_cmd_vel.linear.x + acc_lim_x * dt));
+		control_vel_x = m_robot_direction * fmin(fabs(control_vel_x), fabs(m_last_cmd_vel.linear.x + acc_lim_x * dt));
 		control_vel_x = m_robot_direction * fmax(fabs(control_vel_x), fabs(m_last_cmd_vel.linear.x - 
-		(is_emergency_brake ? emergency_acc_lim_x : acc_lim_x) * dt));
+		(is_emergency_brake ?  m_robot_direction * emergency_acc_lim_x : acc_lim_x) * dt));
+
 	} else {
 		control_vel_x = fmax(fmin(control_vel_x, m_last_cmd_vel.linear.x + acc_lim_x * dt),
 							m_last_cmd_vel.linear.x - (is_emergency_brake ? emergency_acc_lim_x : acc_lim_x) * dt);
@@ -605,6 +620,8 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 	// Calculate vel_yaw
 	control_yawrate = fmin(control_yawrate, m_last_cmd_vel.angular.z + acc_lim_theta * dt);
 	control_yawrate = fmax(control_yawrate, m_last_cmd_vel.angular.z - acc_lim_theta * dt);
+
+
 
 		// constrain velocity after goal reached
 	if(constrain_final && m_is_goal_reached)
@@ -623,13 +640,13 @@ geometry_msgs::msg::TwistStamped NeoLocalPlanner::computeVelocityCommands(
 
 	// fill return data
 
+
 	if(m_robot_direction == -1.0) {
-		cmd_vel.linear.x = m_robot_direction * fmin(fmax(fabs(control_vel_x), min_vel_x), max_vel_x);
+		cmd_vel.linear.x = m_robot_direction * fmin(fmax(fabs(control_vel_x), fabs(min_vel_x)), max_vel_x);
 	}
 	else {
 		cmd_vel.linear.x = fmin(fmax(control_vel_x, min_vel_x), max_vel_x);
 	}
-	
 	cmd_vel.linear.y = fmin(fmax(control_vel_y, min_vel_y), max_vel_y);
 	cmd_vel.linear.z = 0;
 	cmd_vel.angular.x = 0;
@@ -659,6 +676,7 @@ void NeoLocalPlanner::cleanup()
 
 void NeoLocalPlanner::activate()
 {
+	count = 0;
 	m_local_plan_pub->on_activate();
 }
 
@@ -683,31 +701,6 @@ bool NeoLocalPlanner::reset_lastvel(nav_msgs::msg::Path m_global_plan, nav_msgs:
 		return true;
 	}
 	
-}
-
-void NeoLocalPlanner::apply_acceleratiion_limits(double vel_x, double vel_y, double vel_z,
-	 geometry_msgs::msg::Twist last_vel, bool is_em_brake, double is_reversing, double delta_time) {
-
-	// Calculate vel_x
-
-	if(is_reversing == -1.0) {
-		acc_lim_x = is_reversing * acc_lim_x;
-		vel_x = fmin(fabs(vel_x), fabs(last_vel.linear.x + acc_lim_x * delta_time));
-		vel_x = is_reversing * fmax(fabs(vel_x), fabs(last_vel.linear.x - 
-		(is_em_brake ? emergency_acc_lim_x : acc_lim_x) * delta_time));
-	} else {
-		vel_x = fmax(fmin(vel_x, last_vel.linear.x + acc_lim_x * delta_time),
-							last_vel.linear.x - (is_em_brake ? emergency_acc_lim_x : acc_lim_x) * delta_time);
-	}
-	
-	// Calculate vel_y
-	vel_y = fmin(vel_y, last_vel.linear.y + acc_lim_y * delta_time);
-	vel_y = fmax(vel_y, last_vel.linear.y - acc_lim_y * delta_time);
-
-	// Calculate vel_yaw
-	vel_z = fmin(vel_z, last_vel.angular.z + acc_lim_theta * delta_time);
-	vel_z = fmax(vel_z, last_vel.angular.z - acc_lim_theta * delta_time);
-
 }
 
 void NeoLocalPlanner::setPlan(const nav_msgs::msg::Path & plan)

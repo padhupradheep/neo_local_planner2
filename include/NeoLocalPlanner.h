@@ -137,10 +137,6 @@ public:
 
 	bool reset_lastvel(nav_msgs::msg::Path m_global_plan, nav_msgs::msg::Path plan);
 
-	void apply_acceleratiion_limits(double vel_x, double vel_y, double vel_z,
-	 geometry_msgs::msg::Twist last_vel, bool is_em_brake, 
-	 double is_reversing, double delta_time);
-
 private:
 	std::shared_ptr<tf2_ros::Buffer> tf_;
 	std::string plugin_name_;
@@ -234,7 +230,7 @@ protected:
 	double m_robot_direction = 1.0;
 	std::string odom_topic = "odom";
 	std::string local_plan_topic = "local_plan";
-
+	int count = 0;
 	
 };
 
